@@ -1,0 +1,321 @@
+diff --git a/Makefile b/Makefile
+index 6c8b82e..db6bca8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -31,7 +31,7 @@ GITVERSION:=$(shell git rev-parse --short=16 HEAD)
+ $(BUILDDIR):
+ 	rm -rf $@ $@.tmp
+ 	mkdir $@.tmp
+-	rsync -a * $@.tmp
++	rsync -a --exclude='/$(PACKAGE)-[0-9]*/' --exclude='/.git/' ./ $@.tmp
+ 	echo "git clone git://git.proxmox.com/git/pve-manager.git\\ngit checkout $(GITVERSION)" >  $@.tmp/debian/SOURCE
+ 	echo "REPOID_GENERATED=$(GITVERSION)" > $@.tmp/debian/rules.env
+ 	mv $@.tmp $@
+diff --git a/debian/changelog b/debian/changelog
+index 84efd0c..222419b 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,15 @@
++pve-manager (9.2.20+virtsc2) trixie; urgency=medium
++
++  * Expose Thunderstorm MPEG-TS input, input audio, and output in the VM GUI.
++
++ -- BMan <27742182+OnlyBMan@users.noreply.github.com>  Tue, 29 Sep 2026 00:00:00 -0400
++
++pve-manager (9.2.20+virtsc1) trixie; urgency=medium
++
++  * Add Thunderstorm Card selection and device options to the VM GUI.
++
++ -- Local VirTSC Build <build@virtsc.example>  Mon, 28 Sep 2026 00:00:00 -0400
++
+ pve-manager (9.2.20) trixie; urgency=medium
+ 
+   * Revert "partially fix #1989: ui: qemu: disk: add qcow2 cache size config"
+@@ -10143,4 +10155,3 @@ pve-manager (0.9-1) unstable; urgency=low
+   * initial import
+ 
+  -- Proxmox Support Team <support@proxmox.com>  Fri, 23 Nov 2007 13:15:54 +0100
+-
+diff --git a/debian/control b/debian/control
+index 728f660..f5eb2d5 100644
+--- a/debian/control
++++ b/debian/control
+@@ -94,7 +94,7 @@ Depends: apt (>= 1.5~),
+          pve-i18n (>= 3.2.0~),
+          pve-xtermjs (>= 4.7.0-1),
+          pve-yew-mobile-gui (>= 0.5.1),
+-         qemu-server (>= 9.1.13),
++         qemu-server (>= 9.2.8+virtsc2),
+          rsync,
+          spiceterm,
+          sqv,
+diff --git a/www/manager6/Makefile b/www/manager6/Makefile
+index d2ea786..d0b9d37 100644
+--- a/www/manager6/Makefile
++++ b/www/manager6/Makefile
+@@ -255,6 +255,7 @@ JSSRC= 							\
+ 	pool/StatusView.js				\
+ 	pool/Summary.js					\
+ 	qemu/AudioEdit.js				\
++	qemu/ThunderstormEdit.js			\
+ 	qemu/BootOrderEdit.js				\
+ 	qemu/CDEdit.js					\
+ 	qemu/CIDriveEdit.js				\
+diff --git a/www/manager6/qemu/HardwareView.js b/www/manager6/qemu/HardwareView.js
+index f7f4b46..2028181 100644
+--- a/www/manager6/qemu/HardwareView.js
++++ b/www/manager6/qemu/HardwareView.js
+@@ -367,6 +367,21 @@ Ext.define('PVE.qemu.HardwareView', {
+             never_delete: !caps.vms['VM.Config.HWType'],
+             header: gettext('Audio Device'),
+         };
++        rows.thunderstorm = {
++            group: 42,
++            iconCls: 'microchip',
++            editor: caps.vms['VM.Config.HWType'] ? 'PVE.qemu.ThunderstormEdit' : undefined,
++            never_delete: !caps.vms['VM.Config.HWType'],
++            header: gettext('Thunderstorm Card'),
++            renderer: value => {
++                let opts = PVE.Parser.parsePropertyString(String(value), 'enabled');
++                if (String(opts.enabled) === '0') {
++                    return gettext('Disabled');
++                }
++                return `${gettext('Enabled')} (${gettext('Capture Video')}: ` +
++                    Ext.String.htmlEncode(opts.input || 'bars') + ')';
++            },
++        };
+         for (let i = 0; i < 256; i++) {
+             rows['unused' + i.toString()] = {
+                 group: 99,
+@@ -755,6 +770,10 @@ Ext.define('PVE.qemu.HardwareView', {
+             me.down('#addUsb').setDisabled(noVMConfigHWTypePerm || isAtUsbLimit());
+             me.down('#addPci').setDisabled(noVMConfigHWTypePerm || isAtLimit('hostpci'));
+             me.down('#addAudio').setDisabled(noVMConfigHWTypePerm || isAtLimit('audio'));
++            me.down('#addThunderstorm').setDisabled(
++                noVMConfigHWTypePerm || !!me.getObjectValue('thunderstorm') ||
++                /q35/.test(me.getObjectValue('machine') || ''),
++            );
+             me.down('#addSerial').setDisabled(noVMConfigHWTypePerm || isAtLimit('serial'));
+             me.down('#addNet').setDisabled(noVMConfigNetPerm || isAtLimit('net'));
+             me.down('#addRng').setDisabled(noVMConfigHWTypePerm || isAtLimit('rng'));
+@@ -926,6 +945,13 @@ Ext.define('PVE.qemu.HardwareView', {
+                                 disabled: !caps.vms['VM.Config.HWType'],
+                                 handler: editorFactory('AudioEdit'),
+                             },
++                            {
++                                text: gettext('Thunderstorm Card'),
++                                itemId: 'addThunderstorm',
++                                iconCls: 'fa fa-fw fa-microchip black',
++                                disabled: !caps.vms['VM.Config.HWType'],
++                                handler: editorFactory('ThunderstormEdit'),
++                            },
+                             {
+                                 text: gettext('VirtIO RNG'),
+                                 itemId: 'addRng',
+diff --git a/www/manager6/qemu/ThunderstormEdit.js b/www/manager6/qemu/ThunderstormEdit.js
+new file mode 100644
+index 0000000..0598d76
+--- /dev/null
++++ b/www/manager6/qemu/ThunderstormEdit.js
+@@ -0,0 +1,201 @@
++Ext.define('PVE.qemu.ThunderstormInputPanel', {
++    extend: 'Proxmox.panel.InputPanel',
++    xtype: 'pveThunderstormInputPanel',
++
++    onGetValues: function(values) {
++	let options = {};
++	for (const key of [
++	    'version', 'input', 'audio', 'program-display', 'program-audio', 'display', 'display-rate',
++	    'stamp', 'timecode', 'tstamp', 'input-file', 'input-pipe', 'input-audio',
++	    'output', 'ts-input', 'ts-input-audio', 'ts-output', 'frame-log', 'vterm',
++	]) {
++	    let value = values[key];
++	    if (value !== undefined && value !== '' && value !== '__default__') {
++		options[key] = value;
++	    }
++	}
++	let properties = PVE.Parser.printPropertyString(options);
++	return { thunderstorm: properties ? `1,${properties}` : '1' };
++    },
++
++    items: [{
++	xtype: 'textfield',
++	name: 'ts-input',
++	fieldLabel: gettext('TS Input'),
++	emptyText: '/path/on/proxmox-host/input.ts or udp://...',
++	width: 440,
++    }, {
++	xtype: 'proxmoxcheckbox',
++	name: 'ts-input-audio',
++	checked: true,
++	fieldLabel: gettext('TS Input Audio'),
++    }, {
++	xtype: 'textfield',
++	name: 'ts-output',
++	fieldLabel: gettext('TS Output'),
++	emptyText: '/path/on/proxmox-host/output.ts or udp://...',
++	width: 440,
++    }, {
++	xtype: 'displayfield',
++	value: gettext('TS paths and URLs are opened on the Proxmox host. Restart the VM after changing them.'),
++	userCls: 'pmx-hint',
++    }, {
++	xtype: 'proxmoxKVComboBox',
++	name: 'input',
++	value: '__default__',
++	fieldLabel: gettext('Capture Video'),
++	comboItems: [
++	    ['__default__', gettext('Default') + ' (bars)'],
++	    ['bars', gettext('Colour Bars')],
++	    ['ramp', gettext('Ramp')],
++	    ['grid', gettext('Grid')],
++	    ['black', gettext('Black')],
++	    ['none', Proxmox.Utils.NoneText],
++	],
++    }, {
++	xtype: 'proxmoxKVComboBox',
++	name: 'audio',
++	value: '__default__',
++	fieldLabel: gettext('Capture Audio'),
++	comboItems: [
++	    ['__default__', gettext('Default') + ' (off)'],
++	    ['off', gettext('Off')],
++	    ['tone', gettext('Test Tone')],
++	    ['silence', gettext('Silence')],
++	],
++    }, {
++	xtype: 'proxmoxcheckbox',
++	name: 'program-display',
++	checked: true,
++	fieldLabel: gettext('Programme Display'),
++    }, {
++	xtype: 'proxmoxcheckbox',
++	name: 'program-audio',
++	checked: true,
++	fieldLabel: gettext('Programme Audio'),
++    }],
++
++    advancedItems: [{
++	xtype: 'textfield',
++	name: 'version',
++	fieldLabel: gettext('Card Version'),
++	emptyText: '0x011a0012',
++	regex: /^0[xX][0-9a-fA-F]{1,8}$/,
++	regexText: gettext('Enter a 32-bit hexadecimal value, such as 0x011a0012.'),
++    }, {
++	xtype: 'displayfield',
++	value: gettext('A version that differs from the guest firmware can trigger a reflash and reboot.'),
++	userCls: 'pmx-hint',
++    }, {
++	xtype: 'proxmoxcheckbox',
++	name: 'display',
++	checked: true,
++	fieldLabel: gettext('Legacy Display'),
++    }, {
++	xtype: 'proxmoxintegerfield',
++	name: 'display-rate',
++	fieldLabel: gettext('Display Rate') + ' (Hz)',
++	emptyText: '10',
++	minValue: 0,
++	maxValue: 60,
++    }, {
++	xtype: 'proxmoxKVComboBox',
++	name: 'stamp',
++	value: '__default__',
++	fieldLabel: gettext('Capture Timestamp'),
++	comboItems: [
++	    ['__default__', gettext('Default') + ' (host-ns)'],
++	    ['host-ns', 'Host nanoseconds'],
++	    ['host-us', 'Host microseconds'],
++	    ['host-s', 'Host seconds'],
++	    ['virtual-us', 'Virtual microseconds'],
++	    ['zero', 'Zero'],
++	],
++    }, {
++	xtype: 'proxmoxKVComboBox',
++	name: 'timecode',
++	value: '__default__',
++	fieldLabel: gettext('Timecode'),
++	comboItems: [
++	    ['__default__', gettext('Default') + ' (utc)'],
++	    ['utc', 'RTC time'],
++	    ['drop', 'Drop frame'],
++	    ['free', 'Free running'],
++	    ['off', gettext('Off')],
++	],
++    }, {
++	xtype: 'proxmoxKVComboBox',
++	name: 'tstamp',
++	value: '__default__',
++	fieldLabel: gettext('Frame Timestamp'),
++	comboItems: [
++	    ['__default__', gettext('Default') + ' (off)'],
++	    ['off', gettext('Off')],
++	    ['host-ms', 'Host milliseconds'],
++	    ['host-us', 'Host microseconds'],
++	    ['host-s', 'Host seconds'],
++	],
++    }, {
++	xtype: 'displayfield',
++	value: gettext('Host file and FIFO paths below require root. Paths must be absolute.'),
++	userCls: 'pmx-hint',
++    }, {
++	xtype: 'textfield',
++	name: 'input-file',
++	fieldLabel: gettext('Input Frame File'),
++	emptyText: '/path/on/proxmox-host',
++    }, {
++	xtype: 'textfield',
++	name: 'input-pipe',
++	fieldLabel: gettext('Input Video FIFO'),
++	emptyText: '/path/on/proxmox-host',
++    }, {
++	xtype: 'textfield',
++	name: 'input-audio',
++	fieldLabel: gettext('Input Audio FIFO'),
++	emptyText: '/path/on/proxmox-host',
++    }, {
++	xtype: 'textfield',
++	name: 'output',
++	fieldLabel: gettext('Output FIFO'),
++	emptyText: '/path/on/proxmox-host',
++    }, {
++	xtype: 'textfield',
++	name: 'frame-log',
++	fieldLabel: gettext('Frame Log CSV'),
++	emptyText: '/path/on/proxmox-host',
++    }, {
++	xtype: 'textfield',
++	name: 'vterm',
++	fieldLabel: gettext('Debug Chardev ID'),
++    }],
++});
++
++Ext.define('PVE.qemu.ThunderstormEdit', {
++    extend: 'Proxmox.window.Edit',
++    subject: gettext('Thunderstorm Card'),
++    width: 500,
++    items: [{ xtype: 'pveThunderstormInputPanel' }],
++
++    initComponent: function() {
++	let me = this;
++	me.callParent();
++
++	if (!me.isCreate) {
++	    me.load({
++		success: function(response) {
++		    let value = response.result.data.thunderstorm;
++	    if (value) {
++		let options = PVE.Parser.parsePropertyString(value, 'enabled');
++		for (const key of ['program-display', 'program-audio', 'display', 'ts-input-audio']) {
++		    if (options[key] !== undefined) {
++			options[key] = options[key] === 'on' || options[key] === '1' || options[key] === true ? 1 : 0;
++		    }
++		}
++		me.setValues(options);
++		    }
++		},
++	    });
++	}
++    },
++});

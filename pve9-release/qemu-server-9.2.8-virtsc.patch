@@ -1,0 +1,616 @@
+diff --git a/debian/changelog b/debian/changelog
+index c0be391..5e41a41 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,21 @@
++qemu-server (9.2.8+virtsc3) trixie; urgency=medium
++
++  * Wait for transient TS bridge units to clear before relaunching them.
++
++ -- BMan <27742182+OnlyBMan@users.noreply.github.com>  Thu, 01 Oct 2026 00:00:00 -0400
++
++qemu-server (9.2.8+virtsc2) trixie; urgency=medium
++
++  * Manage Thunderstorm MPEG-TS input and output bridges with VM lifecycle.
++
++ -- BMan <27742182+OnlyBMan@users.noreply.github.com>  Tue, 29 Sep 2026 00:00:00 -0400
++
++qemu-server (9.2.8+virtsc1) trixie; urgency=medium
++
++  * Add configurable VirTSC Thunderstorm PCI card and companion devices.
++
++ -- Local VirTSC Build <build@virtsc.example>  Mon, 28 Sep 2026 00:00:00 -0400
++
+ qemu-server (9.2.8) trixie; urgency=medium
+ 
+   * schema: memory: improve description for NUMA policy.
+@@ -6098,4 +6116,3 @@ qemu-server (0.9) unstable; urgency=low
+   * initial release
+ 
+  -- Proxmox Support Team <support@proxmox.com>  Mon,  4 Feb 2008 09:10:13 +0100
+-
+diff --git a/debian/control b/debian/control
+index dd6db31..6c01f9b 100644
+--- a/debian/control
++++ b/debian/control
+@@ -61,7 +61,7 @@ Depends: conntrack,
+          pve-edk2-firmware-ovmf (>= 4.2025.05-2) [amd64],
+          pve-firewall (>= 6.0.3),
+          pve-ha-manager (>= 5.0.3),
+-         pve-qemu-kvm (>= 11.0.3-3),
++         pve-qemu-kvm (>= 11.0.3-3+virtsc2),
+          python3-virt-firmware,
+          socat,
+          swtpm,
+diff --git a/src/PVE/API2/Qemu.pm b/src/PVE/API2/Qemu.pm
+index 71247ee..0956f57 100644
+--- a/src/PVE/API2/Qemu.pm
++++ b/src/PVE/API2/Qemu.pm
+@@ -817,6 +817,7 @@ my $hwtypeoptions = {
+     'vga' => 1,
+     'watchdog' => 1,
+     'audio0' => 1,
++    'thunderstorm' => 1,
+     'rng0' => 1,
+ };
+ 
+@@ -879,6 +880,18 @@ my $check_vm_create_serial_perm = sub {
+     return 1;
+ };
+ 
++my sub check_thunderstorm_host_io_perm {
++    my ($authuser, $param) = @_;
++
++    return if $authuser eq 'root@pam' || !defined($param->{thunderstorm});
++
++    my $device = PVE::JSONSchema::parse_property_string(
++	'pve-qm-thunderstorm', $param->{thunderstorm});
++    for my $key (qw(input-file input-pipe input-audio output ts-input ts-output frame-log vterm)) {
++	die "only root can set Thunderstorm host I/O option '$key'\n" if $device->{$key};
++    }
++}
++
+ my sub check_usb_perm {
+     my ($rpcenv, $authuser, $vmid, $pool, $opt, $value) = @_;
+ 
+@@ -1353,6 +1366,7 @@ __PACKAGE__->register_method({
+             );
+ 
+             &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, $pool, [keys %$param]);
++            check_thunderstorm_host_io_perm($authuser, $param);
+ 
+             &$check_vm_create_serial_perm($rpcenv, $authuser, $vmid, $pool, $param);
+             check_vm_create_usb_perm($rpcenv, $authuser, $vmid, $pool, $param);
+@@ -2196,6 +2210,7 @@ my $update_vm_api = sub {
+     &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [@delete]);
+ 
+     &$check_vm_modify_config_perm($rpcenv, $authuser, $vmid, undef, [keys %$param]);
++    check_thunderstorm_host_io_perm($authuser, $param);
+ 
+     &$check_storage_access(
+         $rpcenv, $authuser, $storecfg, $vmid, $param, undef, $extraction_storage,
+diff --git a/src/PVE/QemuServer.pm b/src/PVE/QemuServer.pm
+index cf46f63..14257a2 100644
+--- a/src/PVE/QemuServer.pm
++++ b/src/PVE/QemuServer.pm
+@@ -95,6 +95,7 @@ use PVE::QemuServer::QSD;
+ use PVE::QemuServer::RNG qw(parse_rng print_rng_device_commandline print_rng_object_commandline);
+ use PVE::QemuServer::RunState;
+ use PVE::QemuServer::StateFile;
++use PVE::QemuServer::ThunderstormTS;
+ use PVE::QemuServer::USB;
+ use PVE::QemuServer::Virtiofs qw(max_virtiofs start_all_virtiofsd);
+ use PVE::QemuServer::VolumeChain;
+@@ -220,6 +221,137 @@ my $audio_fmt = {
+     },
+ };
+ 
++my $thunderstorm_fmt = {
++    enabled => {
++	type => 'boolean',
++	default_key => 1,
++	default => 1,
++	description => 'Expose the virtual Thunderstorm PCI card.',
++    },
++    version => {
++	type => 'string',
++	pattern => '^0[xX][0-9a-fA-F]{1,8}$',
++	format_description => '32-bit hexadecimal value',
++	optional => 1,
++	description => 'Firmware version reported by the card. A mismatch can trigger a guest firmware reflash and reboot.',
++    },
++    input => {
++	type => 'string',
++	enum => [qw(bars ramp grid black none)],
++	optional => 1,
++	description => 'Synthetic capture video source.',
++    },
++    audio => {
++	type => 'string',
++	enum => [qw(off tone silence)],
++	optional => 1,
++	description => 'Synthetic capture audio source.',
++    },
++    stamp => {
++	type => 'string',
++	enum => [qw(host-ns host-us host-s virtual-us zero)],
++	optional => 1,
++	description => 'V4L2 capture timestamp source.',
++    },
++    timecode => {
++	type => 'string',
++	enum => [qw(utc drop free off)],
++	optional => 1,
++	description => 'V4L2 frame timecode mode.',
++    },
++    tstamp => {
++	type => 'string',
++	enum => [qw(off host-ms host-us host-s)],
++	optional => 1,
++	description => 'Timestamp placed in the capture frame.',
++    },
++    'program-display' => {
++	type => 'boolean',
++	optional => 1,
++	description => 'Show the full-rate programme output in the VM console.',
++    },
++    'program-audio' => {
++	type => 'boolean',
++	optional => 1,
++	description => 'Send programme audio to the selected QEMU audio backend.',
++    },
++    display => {
++	type => 'boolean',
++	optional => 1,
++	description => 'Enable the legacy rate-limited card display.',
++    },
++    'display-rate' => {
++	type => 'integer',
++	minimum => 0,
++	maximum => 60,
++	optional => 1,
++	description => 'Console refresh rate in Hz; zero updates every frame.',
++    },
++    'input-file' => {
++	type => 'string',
++	pattern => '^/[^,\x00-\x1f]+$',
++	format_description => 'host-path',
++	optional => 1,
++	description => 'Absolute host path to a packed capture frame.',
++    },
++    'input-pipe' => {
++	type => 'string',
++	pattern => '^/[^,\x00-\x1f]+$',
++	format_description => 'host-path',
++	optional => 1,
++	description => 'Absolute host path to a live video FIFO.',
++    },
++    'input-audio' => {
++	type => 'string',
++	pattern => '^/[^,\x00-\x1f]+$',
++	format_description => 'host-path',
++	optional => 1,
++	description => 'Absolute host path to a live audio FIFO.',
++    },
++    output => {
++	type => 'string',
++	pattern => '^/[^,\x00-\x1f]+$',
++	format_description => 'host-path',
++	optional => 1,
++	description => 'Absolute host path for the programme output FIFO.',
++    },
++    'ts-input' => {
++	type => 'string',
++	pattern => '^(?:/|[A-Za-z][A-Za-z0-9+.-]*://)[^,\x00-\x1f]+$',
++	format_description => 'absolute path or URL',
++	optional => 1,
++	description => 'MPEG transport stream input on the Proxmox host.',
++    },
++    'ts-input-audio' => {
++	type => 'boolean',
++	default => 1,
++	optional => 1,
++	description => 'Use the audio stream from the MPEG-TS input.',
++    },
++    'ts-output' => {
++	type => 'string',
++	pattern => '^(?:/|[A-Za-z][A-Za-z0-9+.-]*://)[^,\x00-\x1f]+$',
++	format_description => 'absolute path or URL',
++	optional => 1,
++	description => 'MPEG transport stream output file or URL on the Proxmox host.',
++    },
++    'frame-log' => {
++	type => 'string',
++	pattern => '^/[^,\x00-\x1f]+$',
++	format_description => 'host-path',
++	optional => 1,
++	description => 'Absolute host path for a frame timing CSV log.',
++    },
++    vterm => {
++	type => 'string',
++	pattern => '^[A-Za-z][A-Za-z0-9._-]*$',
++	format_description => 'chardev-id',
++	optional => 1,
++	description => 'ID of an existing QEMU character device for the card debug console.',
++    },
++};
++PVE::JSONSchema::register_format('pve-qm-thunderstorm', $thunderstorm_fmt);
++
+ my $spice_enhancements_fmt = {
+     foldersharing => {
+         type => 'boolean',
+@@ -701,6 +833,12 @@ EODESCR
+         description => "Configure a audio device, useful in combination with QXL/Spice.",
+         optional => 1,
+     },
++    thunderstorm => {
++	type => 'string',
++	format => $thunderstorm_fmt,
++	description => "Configure the virtual VirTSC Thunderstorm PCI card for this VM.",
++	optional => 1,
++    },
+     spice_enhancements => {
+         type => 'string',
+         format => $spice_enhancements_fmt,
+@@ -3365,12 +3503,61 @@ sub config_to_command {
+         }
+     }
+ 
+-    if (min_version($machine_version, 4, 0) && (my $audio = conf_has_audio($conf))) {
++    my $audio = conf_has_audio($conf);
++    my $has_audio_backend = min_version($machine_version, 4, 0) && $audio;
++    if ($has_audio_backend) {
+         my $audiopciaddr = print_pci_addr("audio0", $arch);
+         my $audio_devs = audio_devs($audio, $audiopciaddr, $machine_version);
+         push @$devices, @$audio_devs;
+     }
+ 
++    my @thunderstorm_devices;
++    my $thunderstorm = $conf->{thunderstorm}
++        ? parse_property_string($thunderstorm_fmt, $conf->{thunderstorm}) : undef;
++    if ($thunderstorm && ($thunderstorm->{enabled} // 1)) {
++        die "Thunderstorm is only supported on x86_64 VMs\n" if $arch ne 'x86_64';
++        die "Thunderstorm requires an i440fx machine\n" if $q35;
++        if ($thunderstorm->{'ts-input'}) {
++            die "Thunderstorm TS input cannot be combined with raw input paths\n"
++                if $thunderstorm->{'input-file'} || $thunderstorm->{'input-pipe'}
++                || $thunderstorm->{'input-audio'};
++            my $paths = PVE::QemuServer::ThunderstormTS::fifo_paths($vmid);
++            $thunderstorm->{'input-pipe'} = $paths->{video};
++            $thunderstorm->{'input-audio'} = $paths->{audio}
++                if $thunderstorm->{'ts-input-audio'} // 1;
++        }
++        if ($thunderstorm->{'ts-output'}) {
++            die "Thunderstorm TS output cannot be combined with a raw output FIFO\n"
++                if $thunderstorm->{output};
++            $thunderstorm->{output} = PVE::QemuServer::ThunderstormTS::fifo_paths($vmid)->{output};
++        }
++        push @$devices, '-global', 'i440FX.agp=on';
++        push @$devices, '-global', 'i440FX.agp-aperture-size=128M';
++        push @$devices, '-global', 'piix3-ide.force-bus-master=on';
++        my $tsc_audio_backend = $has_audio_backend ? $audio->{backend_id} : 'thunderstorm-backend';
++        push @$devices, '-audiodev', 'none,id=thunderstorm-backend' if !$has_audio_backend;
++        my @tsc_options = ('id=tsc0', 'present=on', "audiodev=$tsc_audio_backend");
++        for my $key (qw(version input audio stamp timecode tstamp program-display program-audio
++                    display display-rate input-file input-pipe input-audio output frame-log vterm)) {
++            next if !defined($thunderstorm->{$key}) || $thunderstorm->{$key} eq '';
++            my $value = $thunderstorm->{$key};
++            if ($key =~ /^(?:input-file|input-pipe|input-audio|output|frame-log)$/) {
++                die "Thunderstorm $key must be an absolute host path without commas or control characters\n"
++                    if $value !~ m{^/} || $value =~ /[,\x00-\x1f]/;
++            } elsif ($key eq 'vterm') {
++                die "Thunderstorm vterm must be a QEMU character device ID\n"
++                    if $value !~ /^[A-Za-z][A-Za-z0-9._-]*$/;
++            } elsif ($key =~ /^(?:program-display|program-audio|display)$/) {
++                $value = $value ? 'on' : 'off';
++            }
++            push @tsc_options, "$key=$value";
++        }
++        my $tsc_pciaddr = print_pci_addr('thunderstorm', $arch);
++        push @thunderstorm_devices, '-device', 'thunderstorm,' . join(',', @tsc_options) . $tsc_pciaddr;
++        push @thunderstorm_devices, '-device', 'is1gl,id=is1gl0,mmio=0xfed10000,iobase=0x520';
++        push @thunderstorm_devices, '-device', 'is1-clock';
++    }
++
+     # Add a TPM only if the VM is not a template,
+     # to support backing up template VMs even if the TPM disk is write-protected.
+     add_tpm_device($vmid, $devices, $conf) if !$is_template;
+@@ -3422,6 +3609,9 @@ sub config_to_command {
+         push @$cmd, '-nographic';
+     }
+ 
++    # VGA stays the first noVNC screen; the card's programme output is second.
++    push @$devices, @thunderstorm_devices;
++
+     # For now, handles only specific parts, but the final goal is to cover everything.
+     my $cfg2cmd_opts = { forcemachine => $forcemachine };
+     my $cfg2cmd = PVE::QemuServer::Cfg2Cmd->new($conf, $defaults, $version_guard, $cfg2cmd_opts);
+@@ -5787,6 +5977,19 @@ sub vm_start_nolock {
+         };
+     };
+ 
++    my $thunderstorm_ts = $conf->{thunderstorm}
++        ? parse_property_string($thunderstorm_fmt, $conf->{thunderstorm}) : undef;
++    if ($thunderstorm_ts && ($thunderstorm_ts->{enabled} // 1)) {
++        eval { PVE::QemuServer::ThunderstormTS::start($vmid, $thunderstorm_ts) };
++        if (my $err = $@) {
++            eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
++            warn $@ if $@;
++            eval { cleanup_pci_devices($vmid, $conf) };
++            warn $@ if $@;
++            die "start failed: $err";
++        }
++    }
++
+     if ($conf->{hugepages}) {
+ 
+         my $code = sub {
+@@ -5819,6 +6022,7 @@ sub vm_start_nolock {
+     }
+ 
+     if (my $err = $@) {
++        PVE::QemuServer::ThunderstormTS::stop($vmid) if $thunderstorm_ts;
+         # deactivate volumes if start fails
+         eval { PVE::Storage::deactivate_volumes($storecfg, $vollist); };
+         warn $@ if $@;
+@@ -6151,6 +6355,8 @@ sub vm_stop_cleanup {
+         return if !PVE::QemuServer::RunState::cleanup_flag_exists($vmid);
+     }
+ 
++    PVE::QemuServer::ThunderstormTS::stop($vmid) if $conf->{thunderstorm};
++
+     eval {
+         PVE::QemuServer::QSD::quit($vmid)
+             if PVE::QemuServer::Helpers::qsd_running_locally($vmid);
+diff --git a/src/PVE/QemuServer/Makefile b/src/PVE/QemuServer/Makefile
+index 060fac2..924dce7 100644
+--- a/src/PVE/QemuServer/Makefile
++++ b/src/PVE/QemuServer/Makefile
+@@ -28,6 +28,7 @@ SOURCES=Agent.pm	\
+ 	RNG.pm		\
+ 	RunState.pm	\
+ 	StateFile.pm	\
++	ThunderstormTS.pm \
+ 	USB.pm		\
+ 	Virtiofs.pm	\
+ 	VolumeChain.pm
+diff --git a/src/PVE/QemuServer/PCI.pm b/src/PVE/QemuServer/PCI.pm
+index d7dc612..4b00b1e 100644
+--- a/src/PVE/QemuServer/PCI.pm
++++ b/src/PVE/QemuServer/PCI.pm
+@@ -244,6 +244,7 @@ sub get_pci_addr_map {
+         hostpci13 => { bus => 2, addr => 22 },
+         hostpci14 => { bus => 2, addr => 23 },
+         hostpci15 => { bus => 2, addr => 24 },
++        'thunderstorm' => { bus => 2, addr => 25 },
+         'virtioscsi0' => { bus => 3, addr => 1 },
+         'virtioscsi1' => { bus => 3, addr => 2 },
+         'virtioscsi2' => { bus => 3, addr => 3 },
+diff --git a/src/PVE/QemuServer/ThunderstormTS.pm b/src/PVE/QemuServer/ThunderstormTS.pm
+new file mode 100644
+index 0000000..221c6ac
+--- /dev/null
++++ b/src/PVE/QemuServer/ThunderstormTS.pm
+@@ -0,0 +1,122 @@
++package PVE::QemuServer::ThunderstormTS;
++
++use strict;
++use warnings;
++
++use Exporter 'import';
++use PVE::Tools qw(run_command);
++
++our @EXPORT_OK = qw(fifo_paths start stop);
++
++my $helper = '/usr/local/bin/is1ts';
++my $ffmpeg = '/usr/bin/ffmpeg';
++
++sub fifo_paths {
++    my ($vmid) = @_;
++    die "invalid VM ID for Thunderstorm TS\n" if $vmid !~ /^\d+$/;
++    my $base = "/run/qemu-server/$vmid.virtsc-ts";
++    return {
++        video => "$base-video",
++        audio => "$base-audio",
++        output => "$base-output",
++    };
++}
++
++my sub unit_name {
++    my ($vmid, $direction) = @_;
++    return "virtsc-ts-$direction-$vmid.service";
++}
++
++my sub create_fifo {
++    my ($path) = @_;
++    die "refusing to replace non-FIFO Thunderstorm path '$path'\n" if -e $path && !-p $path;
++    unlink $path or die "cannot remove stale Thunderstorm FIFO '$path': $!\n" if -p $path;
++    run_command(['/usr/bin/mkfifo', '-m', '0600', $path]);
++}
++
++sub stop {
++    my ($vmid) = @_;
++    my $paths = fifo_paths($vmid);
++    for my $direction (qw(input output)) {
++        eval {
++            run_command(
++                ['/bin/systemctl', 'stop', unit_name($vmid, $direction)],
++                outfunc => sub { }, errfunc => sub { }, timeout => 10,
++            );
++        };
++    }
++    for my $path (values %$paths) {
++        unlink $path or warn "cannot remove Thunderstorm FIFO '$path': $!\n" if -p $path;
++    }
++}
++
++my sub wait_for_unit_release {
++    my ($unit) = @_;
++    for (1 .. 25) {
++        my $state = '';
++        run_command(
++            ['/bin/systemctl', 'show', '--property=LoadState', '--value', $unit],
++            outfunc => sub { $state .= $_[0] }, timeout => 5,
++        );
++        return if $state =~ /^not-found\s*$/;
++        select undef, undef, undef, 0.2;
++    }
++    die "Thunderstorm TS service '$unit' is still loaded after stop; inspect it with systemctl status $unit\n";
++}
++
++my sub launch {
++    my ($vmid, $direction, $restart, @program) = @_;
++    my $unit = unit_name($vmid, $direction);
++    wait_for_unit_release($unit);
++    run_command([
++        '/usr/bin/systemd-run', '--quiet', '--collect',
++        '--unit=' . $unit,
++        "--property=Restart=$restart", '--property=RestartSec=2s',
++        '--', @program,
++    ], timeout => 15);
++}
++
++sub start {
++    my ($vmid, $options) = @_;
++    my $source = $options->{'ts-input'};
++    my $target = $options->{'ts-output'};
++    return if !$source && !$target;
++    die "Thunderstorm TS requires /usr/bin/ffmpeg (install the ffmpeg package)\n"
++        if !-x $ffmpeg;
++    die "Thunderstorm TS output requires /usr/local/bin/is1ts (see the install guide)\n"
++        if $target && !-x $helper;
++
++    my $paths = fifo_paths($vmid);
++    stop($vmid);
++    eval {
++        if ($source) {
++            create_fifo($paths->{video});
++            my $with_audio = $options->{'ts-input-audio'} // 1;
++            create_fifo($paths->{audio}) if $with_audio;
++            my @cmd = (
++                $ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin',
++                '-readrate', '1', '-i', $source,
++                '-map', '0:v:0', '-an', '-vf', 'fps=30000/1001,scale=720:480,vflip',
++                '-pix_fmt', 'yuyv422',
++                '-f', 'rawvideo', '-y', $paths->{video},
++            );
++            push @cmd, (
++                '-map', '0:a:0', '-vn', '-ac', '2', '-ar', '48000',
++                '-c:a', 'pcm_s32le', '-f', 's32le', '-y', $paths->{audio},
++            ) if $with_audio;
++            launch($vmid, 'input', 'on-failure', @cmd);
++        }
++        if ($target) {
++            create_fifo($paths->{output});
++            my $restart = $target =~ m{^[a-z][a-z0-9+.-]*://}i ? 'on-failure' : 'no';
++            launch($vmid, 'output', $restart,
++                $helper, '-r', '-i', $paths->{output}, $target);
++        }
++    };
++    if (my $err = $@) {
++        stop($vmid);
++        die $err;
++    }
++}
++
++1;
+diff --git a/src/test/cfg2cmd/thunderstorm-options.conf b/src/test/cfg2cmd/thunderstorm-options.conf
+new file mode 100644
+index 0000000..b4be774
+--- /dev/null
++++ b/src/test/cfg2cmd/thunderstorm-options.conf
+@@ -0,0 +1,4 @@
++# TEST: Thunderstorm card properties and host-side GL launch arguments
++# QEMU_VERSION: 11.0.3
++smbios1: uuid=6cf17dc3-8341-4ecc-aebd-7503f2583fb3
++thunderstorm: 1,version=0xffffffff,input=grid,audio=tone,stamp=host-us,timecode=drop,tstamp=host-ms,program-display=0,program-audio=1,display=1,display-rate=0,input-pipe=/tmp/tsc-in-v,input-audio=/tmp/tsc-in-a,output=/tmp/tsc-out,frame-log=/tmp/tsc-frame.csv
+diff --git a/src/test/cfg2cmd/thunderstorm-options.conf.cmd b/src/test/cfg2cmd/thunderstorm-options.conf.cmd
+new file mode 100644
+index 0000000..2ca1066
+--- /dev/null
++++ b/src/test/cfg2cmd/thunderstorm-options.conf.cmd
+@@ -0,0 +1,34 @@
++/usr/bin/kvm \
++  -id 8006 \
++  -name vm8006 \
++  -no-shutdown \
++  -chardev 'socket,id=qmp,path=/var/run/qemu-server/8006.qmp,server=on,wait=off' \
++  -mon 'chardev=qmp,mode=control' \
++  -chardev 'socket,id=qmp-event,path=/var/run/qmeventd.sock,reconnect-ms=5000' \
++  -mon 'chardev=qmp-event,mode=control' \
++  -pidfile /var/run/qemu-server/8006.pid \
++  -daemonize \
++  -smbios 'type=1,uuid=6cf17dc3-8341-4ecc-aebd-7503f2583fb3' \
++  -smp '1,sockets=1,cores=1,maxcpus=1' \
++  -nodefaults \
++  -boot 'menu=on,strict=on,reboot-timeout=1000,splash=/usr/share/qemu-server/bootsplash.jpg' \
++  -vnc 'unix:/var/run/qemu-server/8006.vnc,password=on' \
++  -cpu kvm64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt,+lahf_lm,+sep \
++  -m 512 \
++  -global 'PIIX4_PM.disable_s3=1' \
++  -global 'PIIX4_PM.disable_s4=1' \
++  -device 'pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e' \
++  -device 'pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f' \
++  -device 'piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2' \
++  -device 'usb-tablet,id=tablet,bus=uhci.0,port=1' \
++  -global 'i440FX.agp=on' \
++  -global 'i440FX.agp-aperture-size=128M' \
++  -global 'piix3-ide.force-bus-master=on' \
++  -audiodev 'none,id=thunderstorm-backend' \
++  -device 'VGA,id=vga,bus=pci.0,addr=0x2' \
++  -device 'thunderstorm,id=tsc0,present=on,audiodev=thunderstorm-backend,version=0xffffffff,input=grid,audio=tone,stamp=host-us,timecode=drop,tstamp=host-ms,program-display=off,program-audio=on,display=on,display-rate=0,input-pipe=/tmp/tsc-in-v,input-audio=/tmp/tsc-in-a,output=/tmp/tsc-out,frame-log=/tmp/tsc-frame.csv,bus=pci.2,addr=0x19' \
++  -device 'is1gl,id=is1gl0,mmio=0xfed10000,iobase=0x520' \
++  -device is1-clock \
++  -device 'virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3,free-page-reporting=on' \
++  -iscsi 'initiator-name=iqn.1993-08.org.debian:01:aabbccddeeff' \
++  -machine 'type=pc+pve0'
+diff --git a/src/test/cfg2cmd/thunderstorm-ts.conf b/src/test/cfg2cmd/thunderstorm-ts.conf
+new file mode 100644
+index 0000000..1b39156
+--- /dev/null
++++ b/src/test/cfg2cmd/thunderstorm-ts.conf
+@@ -0,0 +1,4 @@
++# TEST: Thunderstorm MPEG-TS input and output bridge paths
++# QEMU_VERSION: 11.0.3
++smbios1: uuid=6cf17dc3-8341-4ecc-aebd-7503f2583fb3
++thunderstorm: 1,version=0xffffffff,input=grid,audio=tone,stamp=host-us,timecode=drop,tstamp=host-ms,program-display=0,program-audio=1,display=1,display-rate=0,ts-input=/var/lib/virtsc/input.ts,ts-input-audio=1,ts-output=/var/lib/virtsc/output.ts,frame-log=/tmp/tsc-frame.csv
+diff --git a/src/test/cfg2cmd/thunderstorm-ts.conf.cmd b/src/test/cfg2cmd/thunderstorm-ts.conf.cmd
+new file mode 100644
+index 0000000..726322c
+--- /dev/null
++++ b/src/test/cfg2cmd/thunderstorm-ts.conf.cmd
+@@ -0,0 +1,34 @@
++/usr/bin/kvm \
++  -id 8006 \
++  -name vm8006 \
++  -no-shutdown \
++  -chardev 'socket,id=qmp,path=/var/run/qemu-server/8006.qmp,server=on,wait=off' \
++  -mon 'chardev=qmp,mode=control' \
++  -chardev 'socket,id=qmp-event,path=/var/run/qmeventd.sock,reconnect-ms=5000' \
++  -mon 'chardev=qmp-event,mode=control' \
++  -pidfile /var/run/qemu-server/8006.pid \
++  -daemonize \
++  -smbios 'type=1,uuid=6cf17dc3-8341-4ecc-aebd-7503f2583fb3' \
++  -smp '1,sockets=1,cores=1,maxcpus=1' \
++  -nodefaults \
++  -boot 'menu=on,strict=on,reboot-timeout=1000,splash=/usr/share/qemu-server/bootsplash.jpg' \
++  -vnc 'unix:/var/run/qemu-server/8006.vnc,password=on' \
++  -cpu kvm64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt,+lahf_lm,+sep \
++  -m 512 \
++  -global 'PIIX4_PM.disable_s3=1' \
++  -global 'PIIX4_PM.disable_s4=1' \
++  -device 'pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e' \
++  -device 'pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f' \
++  -device 'piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2' \
++  -device 'usb-tablet,id=tablet,bus=uhci.0,port=1' \
++  -global 'i440FX.agp=on' \
++  -global 'i440FX.agp-aperture-size=128M' \
++  -global 'piix3-ide.force-bus-master=on' \
++  -audiodev 'none,id=thunderstorm-backend' \
++  -device 'VGA,id=vga,bus=pci.0,addr=0x2' \
++  -device 'thunderstorm,id=tsc0,present=on,audiodev=thunderstorm-backend,version=0xffffffff,input=grid,audio=tone,stamp=host-us,timecode=drop,tstamp=host-ms,program-display=off,program-audio=on,display=on,display-rate=0,input-pipe=/run/qemu-server/8006.virtsc-ts-video,input-audio=/run/qemu-server/8006.virtsc-ts-audio,output=/run/qemu-server/8006.virtsc-ts-output,frame-log=/tmp/tsc-frame.csv,bus=pci.2,addr=0x19' \
++  -device 'is1gl,id=is1gl0,mmio=0xfed10000,iobase=0x520' \
++  -device is1-clock \
++  -device 'virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3,free-page-reporting=on' \
++  -iscsi 'initiator-name=iqn.1993-08.org.debian:01:aabbccddeeff' \
++  -machine 'type=pc+pve0'
