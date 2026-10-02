@@ -1,11 +1,11 @@
 /*
- * is1ts - turn the IntelliStar's output into an MPEG transport stream.
+ * is1ts - encode the IntelliStar's raw output for recording or streaming.
  *
  * The sibling of is1view. It reads the same thing - the Thunderstorm
  * model's raw 720x480 BGRA frames with their programme audio, from
  * `-device thunderstorm,output=/path/to/fifo` or TSC_OUTPUT= - but instead
- * of putting them in a window it hands them to ffmpeg and muxes an MPEG-TS.
- * That can go to a file, to stdout, or straight onto the network.
+ * of putting them in a window it hands them to ffmpeg. Files and TS network
+ * outputs use MPEG-TS; RTMP uses FLV.
  *
  *   cc -O2 -pthread -o is1ts is1ts.c -lm
  *
@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -446,8 +447,28 @@ static void usage(void)
 {
 	fprintf(stderr,
 	        "usage: is1ts [-i fifo] [-k | -K] [-a gain_dB] [-r] OUTPUT [ffmpeg encoder args...]\n"
-	        "  OUTPUT is anything ffmpeg can write: out.ts, -, udp://..., srt://...\n");
+	        "  OUTPUT: out.ts, -, udp://..., srt://..., or rtmp://...\n");
 	exit(2);
+}
+
+static int is_rtmp_url(const char *out)
+{
+	const char *scheme_end = strstr(out, "://");
+	size_t n;
+
+	if (!scheme_end) return 0;
+	n = (size_t)(scheme_end - out);
+	return (n == 4 && !strncasecmp(out, "rtmp", n)) ||
+	       (n == 5 && (!strncasecmp(out, "rtmps", n) ||
+	                   !strncasecmp(out, "rtmpt", n) ||
+	                   !strncasecmp(out, "rtmpe", n))) ||
+	       (n == 6 && (!strncasecmp(out, "rtmpts", n) ||
+	                   !strncasecmp(out, "rtmpte", n)));
+}
+
+static int incompatible_rtmp_codec(const char *arg)
+{
+	return !strcasecmp(arg, "mpeg2video") || !strcasecmp(arg, "mp2");
 }
 
 int main(int argc, char **argv)
@@ -456,6 +477,7 @@ int main(int argc, char **argv)
 	const char *out;
 	int mode = 0;           /* 0 picture, 1 key, 2 picture + key */
 	int reconnect = 0;
+	int rtmp;
 	int fd, c, r, status, nin, i;
 	int wfd[3];
 	struct outq wq[3];
@@ -502,6 +524,24 @@ int main(int argc, char **argv)
 		usage();
 	}
 	out = argv[optind];
+	rtmp = is_rtmp_url(out);
+	if (rtmp && mode == 2) {
+		fprintf(stderr, "is1ts: RTMP carries one video stream; -K needs MPEG-TS output\n");
+		return 2;
+	}
+	if (rtmp) {
+		for (i = optind + 1; i + 1 < argc; i++) {
+			if ((!strcmp(argv[i], "-c:v") || !strcmp(argv[i], "-codec:v") ||
+			     !strcmp(argv[i], "-vcodec") || !strcmp(argv[i], "-c:a") ||
+			     !strcmp(argv[i], "-codec:a") || !strcmp(argv[i], "-acodec")) &&
+			    incompatible_rtmp_codec(argv[i + 1])) {
+				fprintf(stderr,
+				        "is1ts: MPEG-2 video/MP2 audio cannot be sent to RTMP; "
+				        "omit encoder options to use H.264/AAC\n");
+				return 2;
+			}
+		}
+	}
 
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = on_signal;      /* no SA_RESTART: let reads see EINTR */
@@ -576,17 +616,20 @@ int main(int argc, char **argv)
 
 	/* 720x480 is 4:3 on air; say so, or players show it stretched. */
 	args[na++] = "-aspect";     args[na++] = "4:3";
-	args[na++] = "-metadata";   args[na++] = "service_provider=VirTSC";
-	args[na++] = "-metadata";   args[na++] = "service_name=IntelliStar";
+	if (!rtmp) {
+		args[na++] = "-metadata"; args[na++] = "service_provider=VirTSC";
+		args[na++] = "-metadata"; args[na++] = "service_name=IntelliStar";
+	} else {
+		args[na++] = "-flvflags"; args[na++] = "no_duration_filesize";
+	}
 	/*
-	 * Live, so mux for latency: ffmpeg's TS muxer otherwise holds 0.7 s
-	 * back, and a pipe reader (MistServer's ts-exec:, ffplay) should get
-	 * packets as soon as they exist rather than when a buffer fills.
+	 * Send live packets promptly. FFmpeg's TS muxer otherwise holds 0.7 s
+	 * before a pipe reader (MistServer's ts-exec:, ffplay) sees them.
 	 */
 	args[na++] = "-muxdelay";   args[na++] = "0";
 	args[na++] = "-muxpreload"; args[na++] = "0";
 	args[na++] = "-flush_packets"; args[na++] = "1";
-	args[na++] = "-f";          args[na++] = "mpegts";
+	args[na++] = "-f";          args[na++] = rtmp ? "flv" : "mpegts";
 	args[na++] = (char *)out;
 	args[na] = NULL;
 
@@ -609,7 +652,8 @@ int main(int argc, char **argv)
 	}
 	pthread_sigmask(SIG_SETMASK, &old, NULL);
 
-	fprintf(stderr, "is1ts: %s -> %s (%s, %u Hz, gain %+.1f dB)\n", in, out,
+	fprintf(stderr, "is1ts: %s -> %s (%s, %u Hz, gain %+.1f dB)\n", in,
+	        rtmp ? "RTMP destination" : out,
 	        mode == 0 ? "picture" : mode == 1 ? "key" : "picture + key", rate,
 	        20.0 * log10(gain));
 
