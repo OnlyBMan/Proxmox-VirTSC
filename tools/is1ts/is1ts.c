@@ -45,6 +45,7 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define W 720
@@ -216,10 +217,18 @@ static int outq_put(struct outq *q, const void *p, size_t len)
 	memcpy(c->data, p, len);
 
 	pthread_mutex_lock(&q->m);
-	while (q->bytes > QUEUE_LIMIT && !q->failed) {
-		pthread_cond_wait(&q->cv, &q->m);
+	while (q->bytes > QUEUE_LIMIT && !q->failed && !stopping) {
+		struct timespec deadline;
+
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_nsec += 100000000;
+		if (deadline.tv_nsec >= 1000000000) {
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000000000;
+		}
+		pthread_cond_timedwait(&q->cv, &q->m, &deadline);
 	}
-	if (q->failed) {
+	if (q->failed || stopping) {
 		pthread_mutex_unlock(&q->m);
 		free(c);
 		return -1;
@@ -577,6 +586,8 @@ int main(int argc, char **argv)
 	args[na++] = "-nostdin";
 
 	args[na++] = "-thread_queue_size"; args[na++] = "1024";
+	args[na++] = "-probesize"; args[na++] = "32";
+	args[na++] = "-analyzeduration"; args[na++] = "0";
 	args[na++] = "-f";          args[na++] = "rawvideo";
 	args[na++] = "-pix_fmt";    args[na++] = mode == 1 ? "gray" : "bgra";
 	args[na++] = "-s";          args[na++] = "720x480";
@@ -584,6 +595,8 @@ int main(int argc, char **argv)
 	args[na++] = "-i";          args[na++] = "pipe:3";
 
 	args[na++] = "-thread_queue_size"; args[na++] = "1024";
+	args[na++] = "-probesize"; args[na++] = "32";
+	args[na++] = "-analyzeduration"; args[na++] = "0";
 	args[na++] = "-f";          args[na++] = "s32le";
 	args[na++] = "-ar";         args[na++] = rate_s;
 	args[na++] = "-ac";         args[na++] = "2";
@@ -591,6 +604,8 @@ int main(int argc, char **argv)
 
 	if (mode == 2) {
 		args[na++] = "-thread_queue_size"; args[na++] = "1024";
+		args[na++] = "-probesize"; args[na++] = "32";
+		args[na++] = "-analyzeduration"; args[na++] = "0";
 		args[na++] = "-f";          args[na++] = "rawvideo";
 		args[na++] = "-pix_fmt";    args[na++] = "gray";
 		args[na++] = "-s";          args[na++] = "720x480";
@@ -686,6 +701,10 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* A service stop must not wait for a stalled ffmpeg input to drain. */
+	if (stopping) {
+		kill(pid, SIGTERM);
+	}
 	/* Drain and close the pipes: ffmpeg's cue to flush and finish the TS. */
 	for (i = 0; i < nin; i++) {
 		outq_close(&wq[i]);
