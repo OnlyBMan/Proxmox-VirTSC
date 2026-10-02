@@ -6,8 +6,8 @@ using the binaries in this directory:
 
 | Package | Required base version | Bundle file |
 | --- | --- | --- |
-| `pve-qemu-kvm` | `11.0.3-3` | `pve-qemu-kvm_11.0.3-3+virtsc2_amd64.deb` |
-| `qemu-server` | `9.2.8` | `qemu-server_9.2.8+virtsc3_amd64.deb` |
+| `pve-qemu-kvm` | `11.0.3-3` | `pve-qemu-kvm_11.0.3-3+virtsc3_amd64.deb` |
+| `qemu-server` | `9.2.8` | `qemu-server_9.2.8+virtsc4_amd64.deb` |
 | `pve-manager` | `9.2.20` | `pve-manager_9.2.20+virtsc2_all.deb` |
 
 ```sh
@@ -38,8 +38,8 @@ cd rollback
 apt download pve-qemu-kvm=11.0.3-3 qemu-server=9.2.8 pve-manager=9.2.20
 cd ..
 sha256sum -c SHA256SUMS
-apt -s install ./pve-qemu-kvm_11.0.3-3+virtsc2_amd64.deb \
-  ./qemu-server_9.2.8+virtsc3_amd64.deb \
+apt -s install ./pve-qemu-kvm_11.0.3-3+virtsc3_amd64.deb \
+  ./qemu-server_9.2.8+virtsc4_amd64.deb \
   ./pve-manager_9.2.20+virtsc2_all.deb
 ```
 
@@ -47,8 +47,8 @@ If the preview would remove `proxmox-ve` or unrelated packages, stop here.
 Keep the original packages for rollback, then install:
 
 ```sh
-apt install ./pve-qemu-kvm_11.0.3-3+virtsc2_amd64.deb \
-  ./qemu-server_9.2.8+virtsc3_amd64.deb \
+apt install ./pve-qemu-kvm_11.0.3-3+virtsc3_amd64.deb \
+  ./qemu-server_9.2.8+virtsc4_amd64.deb \
   ./pve-manager_9.2.20+virtsc2_all.deb
 systemctl restart pvedaemon pveproxy
 ```

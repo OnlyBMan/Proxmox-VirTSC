@@ -2,7 +2,13 @@ diff --git a/debian/changelog b/debian/changelog
 index c0be391..5e41a41 100644
 --- a/debian/changelog
 +++ b/debian/changelog
-@@ -1,3 +1,21 @@
+@@ -1,3 +1,27 @@
++qemu-server (9.2.8+virtsc4) trixie; urgency=medium
++
++  * Omit unused USB controllers when the VM has tablet disabled.
++
++ -- BMan <27742182+OnlyBMan@users.noreply.github.com>  Fri, 02 Oct 2026 00:00:00 -0400
++
 +qemu-server (9.2.8+virtsc3) trixie; urgency=medium
 +
 +  * Wait for transient TS bridge units to clear before relaunching them.
@@ -38,7 +44,7 @@ index dd6db31..6c01f9b 100644
           pve-firewall (>= 6.0.3),
           pve-ha-manager (>= 5.0.3),
 -         pve-qemu-kvm (>= 11.0.3-3),
-+         pve-qemu-kvm (>= 11.0.3-3+virtsc2),
++         pve-qemu-kvm (>= 11.0.3-3+virtsc3),
           python3-virt-firmware,
           socat,
           swtpm,
@@ -386,6 +392,17 @@ index d7dc612..4b00b1e 100644
          'virtioscsi0' => { bus => 3, addr => 1 },
          'virtioscsi1' => { bus => 3, addr => 2 },
          'virtioscsi2' => { bus => 3, addr => 3 },
+diff --git a/src/PVE/QemuServer/USB.pm b/src/PVE/QemuServer/USB.pm
+index d75507e..ca759d5 100644
+--- a/src/PVE/QemuServer/USB.pm
++++ b/src/PVE/QemuServer/USB.pm
+@@ -127,0 +128,6 @@ sub get_usb_controllers {
++    # An explicit tablet=0 with no mapped USB devices needs no controller.
++    if (defined($conf->{tablet}) && !$conf->{tablet}) {
++        my $has_usb = grep { $conf->{"usb$_"} } 0 .. $MAX_USB_DEVICES - 1;
++        return () if !$has_usb;
++    }
++
 diff --git a/src/PVE/QemuServer/ThunderstormTS.pm b/src/PVE/QemuServer/ThunderstormTS.pm
 new file mode 100644
 index 0000000..221c6ac

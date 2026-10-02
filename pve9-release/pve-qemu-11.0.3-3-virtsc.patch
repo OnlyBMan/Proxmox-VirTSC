@@ -25,10 +25,10 @@ index db0a094..1ca36d8 100644
 --- a/debian/changelog
 +++ b/debian/changelog
 @@ -1,3 +1,10 @@
-+pve-qemu-kvm (11.0.3-3+virtsc2) trixie; urgency=medium
++pve-qemu-kvm (11.0.3-3+virtsc3) trixie; urgency=medium
 +
 +  * Add VirTSC Thunderstorm PCI card, AGP aperture, PIIX IDE compatibility,
-+    IS1 clock, and OSMesa rendering with GL context handoff for Proxmox VE 9.2.
++    IS1 clock, and isolated OSMesa rendering for Proxmox VE 9.2.
 +
 + -- Local VirTSC Build <build@virtsc.example>  Mon, 28 Sep 2026 00:00:00 -0400
 +
@@ -52,6 +52,14 @@ index ea9871d..de1f399 100644
                 libpci-dev,
                 libpixman-1-dev,
                 libpng-dev,
+@@ -54,6 +55,7 @@ Package: pve-qemu-kvm
+ Architecture: any
+ Depends: ceph-common (>= 0.48),
+          fuse3,
+          iproute2,
++         libosmesa6,
+          ${misc:Depends},
+          ${shlibs:Depends},
 diff --git a/debian/patches/series b/debian/patches/series
 index 6ef37f4..4a33551 100644
 --- a/debian/patches/series
@@ -63,10 +71,10 @@ index 6ef37f4..4a33551 100644
 +virtsc/0001-thunderstorm-card.patch
 diff --git a/debian/patches/virtsc/0001-thunderstorm-card.patch b/debian/patches/virtsc/0001-thunderstorm-card.patch
 new file mode 100644
-index 0000000..19df53a
+index 0000000..b3d8fd3
 --- /dev/null
 +++ b/debian/patches/virtsc/0001-thunderstorm-card.patch
-@@ -0,0 +1,6305 @@
+@@ -0,0 +1,6540 @@
 +diff --git a/hmp-commands-info.hx b/hmp-commands-info.hx
 +index 74c741f..dba39c5 100644
 +--- a/hmp-commands-info.hx
@@ -435,10 +443,10 @@ index 0000000..19df53a
 ++}
 +diff --git a/hw/misc/is1gl.c b/hw/misc/is1gl.c
 +new file mode 100644
-+index 0000000..3f00534
++index 0000000..427af9b
 +--- /dev/null
 ++++ b/hw/misc/is1gl.c
-+@@ -0,0 +1,1716 @@
++@@ -0,0 +1,1951 @@
 ++/*
 ++ * is1gl - GL command transport for the virtualised IntelliStar 1.
 ++ *
@@ -506,6 +514,236 @@ index 0000000..19df53a
 ++#include <GL/gl.h>
 ++#include <GL/glext.h>
 ++#include <GL/osmesa.h>
+++#ifndef _WIN32
+++#include <dlfcn.h>
+++/* Keep OSMesa out of the global dynamic-linker scope. */
+++static typeof(&OSMesaCreateContextAttribs) is1gl_OSMesaCreateContextAttribs;
+++static typeof(&OSMesaCreateContextExt) is1gl_OSMesaCreateContextExt;
+++static typeof(&OSMesaDestroyContext) is1gl_OSMesaDestroyContext;
+++static typeof(&OSMesaGetProcAddress) is1gl_OSMesaGetProcAddress;
+++static typeof(&OSMesaMakeCurrent) is1gl_OSMesaMakeCurrent;
+++static typeof(&glBegin) is1gl_glBegin;
+++static typeof(&glBindFramebuffer) is1gl_glBindFramebuffer;
+++static typeof(&glBindRenderbuffer) is1gl_glBindRenderbuffer;
+++static typeof(&glBindTexture) is1gl_glBindTexture;
+++static typeof(&glBlendFunc) is1gl_glBlendFunc;
+++static typeof(&glCallList) is1gl_glCallList;
+++static typeof(&glCheckFramebufferStatus) is1gl_glCheckFramebufferStatus;
+++static typeof(&glClear) is1gl_glClear;
+++static typeof(&glClearBufferfv) is1gl_glClearBufferfv;
+++static typeof(&glClearColor) is1gl_glClearColor;
+++static typeof(&glClipPlane) is1gl_glClipPlane;
+++static typeof(&glColor4f) is1gl_glColor4f;
+++static typeof(&glCopyTexSubImage2D) is1gl_glCopyTexSubImage2D;
+++static typeof(&glDeleteLists) is1gl_glDeleteLists;
+++static typeof(&glDeleteTextures) is1gl_glDeleteTextures;
+++static typeof(&glDisable) is1gl_glDisable;
+++static typeof(&glDrawPixels) is1gl_glDrawPixels;
+++static typeof(&glEnable) is1gl_glEnable;
+++static typeof(&glEnd) is1gl_glEnd;
+++static typeof(&glEndList) is1gl_glEndList;
+++static typeof(&glFramebufferRenderbuffer) is1gl_glFramebufferRenderbuffer;
+++static typeof(&glGenFramebuffers) is1gl_glGenFramebuffers;
+++static typeof(&glGenRenderbuffers) is1gl_glGenRenderbuffers;
+++static typeof(&glGetDoublev) is1gl_glGetDoublev;
+++static typeof(&glGetError) is1gl_glGetError;
+++static typeof(&glGetIntegerv) is1gl_glGetIntegerv;
+++static typeof(&glGetString) is1gl_glGetString;
+++static typeof(&glGetTexImage) is1gl_glGetTexImage;
+++static typeof(&glGetTexLevelParameteriv) is1gl_glGetTexLevelParameteriv;
+++static typeof(&glIsEnabled) is1gl_glIsEnabled;
+++static typeof(&glLineWidth) is1gl_glLineWidth;
+++static typeof(&glLoadIdentity) is1gl_glLoadIdentity;
+++static typeof(&glLoadMatrixd) is1gl_glLoadMatrixd;
+++static typeof(&glMatrixMode) is1gl_glMatrixMode;
+++static typeof(&glMultMatrixd) is1gl_glMultMatrixd;
+++static typeof(&glMultMatrixf) is1gl_glMultMatrixf;
+++static typeof(&glNewList) is1gl_glNewList;
+++static typeof(&glPixelStoref) is1gl_glPixelStoref;
+++static typeof(&glPixelStorei) is1gl_glPixelStorei;
+++static typeof(&glPopAttrib) is1gl_glPopAttrib;
+++static typeof(&glPopClientAttrib) is1gl_glPopClientAttrib;
+++static typeof(&glPopMatrix) is1gl_glPopMatrix;
+++static typeof(&glPushAttrib) is1gl_glPushAttrib;
+++static typeof(&glPushClientAttrib) is1gl_glPushClientAttrib;
+++static typeof(&glPushMatrix) is1gl_glPushMatrix;
+++static typeof(&glReadPixels) is1gl_glReadPixels;
+++static typeof(&glRenderbufferStorage) is1gl_glRenderbufferStorage;
+++static typeof(&glRotated) is1gl_glRotated;
+++static typeof(&glRotatef) is1gl_glRotatef;
+++static typeof(&glScalef) is1gl_glScalef;
+++static typeof(&glScissor) is1gl_glScissor;
+++static typeof(&glTexCoord2f) is1gl_glTexCoord2f;
+++static typeof(&glTexEnvf) is1gl_glTexEnvf;
+++static typeof(&glTexEnvi) is1gl_glTexEnvi;
+++static typeof(&glTexImage2D) is1gl_glTexImage2D;
+++static typeof(&glTexParameterf) is1gl_glTexParameterf;
+++static typeof(&glTexParameteri) is1gl_glTexParameteri;
+++static typeof(&glTexSubImage2D) is1gl_glTexSubImage2D;
+++static typeof(&glTranslated) is1gl_glTranslated;
+++static typeof(&glTranslatef) is1gl_glTranslatef;
+++static typeof(&glVertex2d) is1gl_glVertex2d;
+++static typeof(&glVertex2f) is1gl_glVertex2f;
+++static typeof(&glViewport) is1gl_glViewport;
+++#define OSMesaCreateContextAttribs is1gl_OSMesaCreateContextAttribs
+++#define OSMesaCreateContextExt is1gl_OSMesaCreateContextExt
+++#define OSMesaDestroyContext is1gl_OSMesaDestroyContext
+++#define OSMesaGetProcAddress is1gl_OSMesaGetProcAddress
+++#define OSMesaMakeCurrent is1gl_OSMesaMakeCurrent
+++#define glBegin is1gl_glBegin
+++#define glBindFramebuffer is1gl_glBindFramebuffer
+++#define glBindRenderbuffer is1gl_glBindRenderbuffer
+++#define glBindTexture is1gl_glBindTexture
+++#define glBlendFunc is1gl_glBlendFunc
+++#define glCallList is1gl_glCallList
+++#define glCheckFramebufferStatus is1gl_glCheckFramebufferStatus
+++#define glClear is1gl_glClear
+++#define glClearBufferfv is1gl_glClearBufferfv
+++#define glClearColor is1gl_glClearColor
+++#define glClipPlane is1gl_glClipPlane
+++#define glColor4f is1gl_glColor4f
+++#define glCopyTexSubImage2D is1gl_glCopyTexSubImage2D
+++#define glDeleteLists is1gl_glDeleteLists
+++#define glDeleteTextures is1gl_glDeleteTextures
+++#define glDisable is1gl_glDisable
+++#define glDrawPixels is1gl_glDrawPixels
+++#define glEnable is1gl_glEnable
+++#define glEnd is1gl_glEnd
+++#define glEndList is1gl_glEndList
+++#define glFramebufferRenderbuffer is1gl_glFramebufferRenderbuffer
+++#define glGenFramebuffers is1gl_glGenFramebuffers
+++#define glGenRenderbuffers is1gl_glGenRenderbuffers
+++#define glGetDoublev is1gl_glGetDoublev
+++#define glGetError is1gl_glGetError
+++#define glGetIntegerv is1gl_glGetIntegerv
+++#define glGetString is1gl_glGetString
+++#define glGetTexImage is1gl_glGetTexImage
+++#define glGetTexLevelParameteriv is1gl_glGetTexLevelParameteriv
+++#define glIsEnabled is1gl_glIsEnabled
+++#define glLineWidth is1gl_glLineWidth
+++#define glLoadIdentity is1gl_glLoadIdentity
+++#define glLoadMatrixd is1gl_glLoadMatrixd
+++#define glMatrixMode is1gl_glMatrixMode
+++#define glMultMatrixd is1gl_glMultMatrixd
+++#define glMultMatrixf is1gl_glMultMatrixf
+++#define glNewList is1gl_glNewList
+++#define glPixelStoref is1gl_glPixelStoref
+++#define glPixelStorei is1gl_glPixelStorei
+++#define glPopAttrib is1gl_glPopAttrib
+++#define glPopClientAttrib is1gl_glPopClientAttrib
+++#define glPopMatrix is1gl_glPopMatrix
+++#define glPushAttrib is1gl_glPushAttrib
+++#define glPushClientAttrib is1gl_glPushClientAttrib
+++#define glPushMatrix is1gl_glPushMatrix
+++#define glReadPixels is1gl_glReadPixels
+++#define glRenderbufferStorage is1gl_glRenderbufferStorage
+++#define glRotated is1gl_glRotated
+++#define glRotatef is1gl_glRotatef
+++#define glScalef is1gl_glScalef
+++#define glScissor is1gl_glScissor
+++#define glTexCoord2f is1gl_glTexCoord2f
+++#define glTexEnvf is1gl_glTexEnvf
+++#define glTexEnvi is1gl_glTexEnvi
+++#define glTexImage2D is1gl_glTexImage2D
+++#define glTexParameterf is1gl_glTexParameterf
+++#define glTexParameteri is1gl_glTexParameteri
+++#define glTexSubImage2D is1gl_glTexSubImage2D
+++#define glTranslated is1gl_glTranslated
+++#define glTranslatef is1gl_glTranslatef
+++#define glVertex2d is1gl_glVertex2d
+++#define glVertex2f is1gl_glVertex2f
+++#define glViewport is1gl_glViewport
+++static bool is1gl_load_osmesa(Error **errp)
+++{
+++    static void *lib;
+++    if (lib) {
+++        return true;
+++    }
+++    lib = dlopen("libOSMesa.so.8", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+++    if (!lib) {
+++        error_setg(errp, "is1gl: cannot load OSMesa: %s", dlerror());
+++        return false;
+++    }
+++#define IS1GL_LOAD(name) do { \
+++    is1gl_##name = (typeof(is1gl_##name))dlsym(lib, #name); \
+++    if (!is1gl_##name) { \
+++        error_setg(errp, "is1gl: OSMesa symbol %s unavailable", #name); \
+++        return false; \
+++    } \
+++} while (0)
+++    IS1GL_LOAD(OSMesaCreateContextAttribs);
+++    IS1GL_LOAD(OSMesaCreateContextExt);
+++    IS1GL_LOAD(OSMesaDestroyContext);
+++    IS1GL_LOAD(OSMesaGetProcAddress);
+++    IS1GL_LOAD(OSMesaMakeCurrent);
+++    IS1GL_LOAD(glBegin);
+++    IS1GL_LOAD(glBindFramebuffer);
+++    IS1GL_LOAD(glBindRenderbuffer);
+++    IS1GL_LOAD(glBindTexture);
+++    IS1GL_LOAD(glBlendFunc);
+++    IS1GL_LOAD(glCallList);
+++    IS1GL_LOAD(glCheckFramebufferStatus);
+++    IS1GL_LOAD(glClear);
+++    IS1GL_LOAD(glClearBufferfv);
+++    IS1GL_LOAD(glClearColor);
+++    IS1GL_LOAD(glClipPlane);
+++    IS1GL_LOAD(glColor4f);
+++    IS1GL_LOAD(glCopyTexSubImage2D);
+++    IS1GL_LOAD(glDeleteLists);
+++    IS1GL_LOAD(glDeleteTextures);
+++    IS1GL_LOAD(glDisable);
+++    IS1GL_LOAD(glDrawPixels);
+++    IS1GL_LOAD(glEnable);
+++    IS1GL_LOAD(glEnd);
+++    IS1GL_LOAD(glEndList);
+++    IS1GL_LOAD(glFramebufferRenderbuffer);
+++    IS1GL_LOAD(glGenFramebuffers);
+++    IS1GL_LOAD(glGenRenderbuffers);
+++    IS1GL_LOAD(glGetDoublev);
+++    IS1GL_LOAD(glGetError);
+++    IS1GL_LOAD(glGetIntegerv);
+++    IS1GL_LOAD(glGetString);
+++    IS1GL_LOAD(glGetTexImage);
+++    IS1GL_LOAD(glGetTexLevelParameteriv);
+++    IS1GL_LOAD(glIsEnabled);
+++    IS1GL_LOAD(glLineWidth);
+++    IS1GL_LOAD(glLoadIdentity);
+++    IS1GL_LOAD(glLoadMatrixd);
+++    IS1GL_LOAD(glMatrixMode);
+++    IS1GL_LOAD(glMultMatrixd);
+++    IS1GL_LOAD(glMultMatrixf);
+++    IS1GL_LOAD(glNewList);
+++    IS1GL_LOAD(glPixelStoref);
+++    IS1GL_LOAD(glPixelStorei);
+++    IS1GL_LOAD(glPopAttrib);
+++    IS1GL_LOAD(glPopClientAttrib);
+++    IS1GL_LOAD(glPopMatrix);
+++    IS1GL_LOAD(glPushAttrib);
+++    IS1GL_LOAD(glPushClientAttrib);
+++    IS1GL_LOAD(glPushMatrix);
+++    IS1GL_LOAD(glReadPixels);
+++    IS1GL_LOAD(glRenderbufferStorage);
+++    IS1GL_LOAD(glRotated);
+++    IS1GL_LOAD(glRotatef);
+++    IS1GL_LOAD(glScalef);
+++    IS1GL_LOAD(glScissor);
+++    IS1GL_LOAD(glTexCoord2f);
+++    IS1GL_LOAD(glTexEnvf);
+++    IS1GL_LOAD(glTexEnvi);
+++    IS1GL_LOAD(glTexImage2D);
+++    IS1GL_LOAD(glTexParameterf);
+++    IS1GL_LOAD(glTexParameteri);
+++    IS1GL_LOAD(glTexSubImage2D);
+++    IS1GL_LOAD(glTranslated);
+++    IS1GL_LOAD(glTranslatef);
+++    IS1GL_LOAD(glVertex2d);
+++    IS1GL_LOAD(glVertex2f);
+++    IS1GL_LOAD(glViewport);
+++#undef IS1GL_LOAD
+++    return true;
+++}
+++#endif
+++
 ++
 ++#ifdef _WIN32
 ++static PFNGLBINDFRAMEBUFFERPROC is1gl_glBindFramebuffer;
@@ -1910,6 +2148,11 @@ index 0000000..19df53a
 ++{
 ++    Is1glState *s = IS1GL(dev);
 ++    ISADevice *isa = ISA_DEVICE(dev);
+++#ifndef _WIN32
+++    if (!is1gl_load_osmesa(errp)) {
+++        return;
+++    }
+++#endif
 ++
 ++    qemu_mutex_init(&s->lock);
 ++    qemu_cond_init(&s->cond);
@@ -2622,7 +2865,7 @@ index 0000000..19df53a
 ++# OSMesa was not present at build time.
 ++if osmesa.found()
 ++  specific_ss.add(when: 'CONFIG_PC',
-++                  if_true: [files('is1gl.c'), osmesa],
+++                  if_true: files('is1gl.c'),
 ++                  if_false: files('is1gl-stub.c'))
 ++else
 ++  specific_ss.add(files('is1gl-stub.c'))
