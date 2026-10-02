@@ -1,11 +1,11 @@
 /*
- * is1ts - turn the IntelliStar's output into an MPEG transport stream.
+ * is1ts - encode the IntelliStar's raw output for recording or streaming.
  *
  * The sibling of is1view. It reads the same thing - the Thunderstorm
  * model's raw 720x480 BGRA frames with their programme audio, from
  * `-device thunderstorm,output=/path/to/fifo` or TSC_OUTPUT= - but instead
- * of putting them in a window it hands them to ffmpeg and muxes an MPEG-TS.
- * That can go to a file, to stdout, or straight onto the network.
+ * of putting them in a window it hands them to ffmpeg. Files and TS network
+ * outputs use MPEG-TS; RTMP uses FLV.
  *
  *   cc -O2 -pthread -o is1ts is1ts.c -lm
  *
@@ -42,8 +42,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define W 720
@@ -215,10 +217,18 @@ static int outq_put(struct outq *q, const void *p, size_t len)
 	memcpy(c->data, p, len);
 
 	pthread_mutex_lock(&q->m);
-	while (q->bytes > QUEUE_LIMIT && !q->failed) {
-		pthread_cond_wait(&q->cv, &q->m);
+	while (q->bytes > QUEUE_LIMIT && !q->failed && !stopping) {
+		struct timespec deadline;
+
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_nsec += 100000000;
+		if (deadline.tv_nsec >= 1000000000) {
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000000000;
+		}
+		pthread_cond_timedwait(&q->cv, &q->m, &deadline);
 	}
-	if (q->failed) {
+	if (q->failed || stopping) {
 		pthread_mutex_unlock(&q->m);
 		free(c);
 		return -1;
@@ -446,8 +456,28 @@ static void usage(void)
 {
 	fprintf(stderr,
 	        "usage: is1ts [-i fifo] [-k | -K] [-a gain_dB] [-r] OUTPUT [ffmpeg encoder args...]\n"
-	        "  OUTPUT is anything ffmpeg can write: out.ts, -, udp://..., srt://...\n");
+	        "  OUTPUT: out.ts, -, udp://..., srt://..., or rtmp://...\n");
 	exit(2);
+}
+
+static int is_rtmp_url(const char *out)
+{
+	const char *scheme_end = strstr(out, "://");
+	size_t n;
+
+	if (!scheme_end) return 0;
+	n = (size_t)(scheme_end - out);
+	return (n == 4 && !strncasecmp(out, "rtmp", n)) ||
+	       (n == 5 && (!strncasecmp(out, "rtmps", n) ||
+	                   !strncasecmp(out, "rtmpt", n) ||
+	                   !strncasecmp(out, "rtmpe", n))) ||
+	       (n == 6 && (!strncasecmp(out, "rtmpts", n) ||
+	                   !strncasecmp(out, "rtmpte", n)));
+}
+
+static int incompatible_rtmp_codec(const char *arg)
+{
+	return !strcasecmp(arg, "mpeg2video") || !strcasecmp(arg, "mp2");
 }
 
 int main(int argc, char **argv)
@@ -456,6 +486,7 @@ int main(int argc, char **argv)
 	const char *out;
 	int mode = 0;           /* 0 picture, 1 key, 2 picture + key */
 	int reconnect = 0;
+	int rtmp;
 	int fd, c, r, status, nin, i;
 	int wfd[3];
 	struct outq wq[3];
@@ -502,6 +533,24 @@ int main(int argc, char **argv)
 		usage();
 	}
 	out = argv[optind];
+	rtmp = is_rtmp_url(out);
+	if (rtmp && mode == 2) {
+		fprintf(stderr, "is1ts: RTMP carries one video stream; -K needs MPEG-TS output\n");
+		return 2;
+	}
+	if (rtmp) {
+		for (i = optind + 1; i + 1 < argc; i++) {
+			if ((!strcmp(argv[i], "-c:v") || !strcmp(argv[i], "-codec:v") ||
+			     !strcmp(argv[i], "-vcodec") || !strcmp(argv[i], "-c:a") ||
+			     !strcmp(argv[i], "-codec:a") || !strcmp(argv[i], "-acodec")) &&
+			    incompatible_rtmp_codec(argv[i + 1])) {
+				fprintf(stderr,
+				        "is1ts: MPEG-2 video/MP2 audio cannot be sent to RTMP; "
+				        "omit encoder options to use H.264/AAC\n");
+				return 2;
+			}
+		}
+	}
 
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = on_signal;      /* no SA_RESTART: let reads see EINTR */
@@ -537,6 +586,8 @@ int main(int argc, char **argv)
 	args[na++] = "-nostdin";
 
 	args[na++] = "-thread_queue_size"; args[na++] = "1024";
+	args[na++] = "-probesize"; args[na++] = "32";
+	args[na++] = "-analyzeduration"; args[na++] = "0";
 	args[na++] = "-f";          args[na++] = "rawvideo";
 	args[na++] = "-pix_fmt";    args[na++] = mode == 1 ? "gray" : "bgra";
 	args[na++] = "-s";          args[na++] = "720x480";
@@ -544,6 +595,8 @@ int main(int argc, char **argv)
 	args[na++] = "-i";          args[na++] = "pipe:3";
 
 	args[na++] = "-thread_queue_size"; args[na++] = "1024";
+	args[na++] = "-probesize"; args[na++] = "32";
+	args[na++] = "-analyzeduration"; args[na++] = "0";
 	args[na++] = "-f";          args[na++] = "s32le";
 	args[na++] = "-ar";         args[na++] = rate_s;
 	args[na++] = "-ac";         args[na++] = "2";
@@ -551,6 +604,8 @@ int main(int argc, char **argv)
 
 	if (mode == 2) {
 		args[na++] = "-thread_queue_size"; args[na++] = "1024";
+		args[na++] = "-probesize"; args[na++] = "32";
+		args[na++] = "-analyzeduration"; args[na++] = "0";
 		args[na++] = "-f";          args[na++] = "rawvideo";
 		args[na++] = "-pix_fmt";    args[na++] = "gray";
 		args[na++] = "-s";          args[na++] = "720x480";
@@ -576,17 +631,20 @@ int main(int argc, char **argv)
 
 	/* 720x480 is 4:3 on air; say so, or players show it stretched. */
 	args[na++] = "-aspect";     args[na++] = "4:3";
-	args[na++] = "-metadata";   args[na++] = "service_provider=VirTSC";
-	args[na++] = "-metadata";   args[na++] = "service_name=IntelliStar";
+	if (!rtmp) {
+		args[na++] = "-metadata"; args[na++] = "service_provider=VirTSC";
+		args[na++] = "-metadata"; args[na++] = "service_name=IntelliStar";
+	} else {
+		args[na++] = "-flvflags"; args[na++] = "no_duration_filesize";
+	}
 	/*
-	 * Live, so mux for latency: ffmpeg's TS muxer otherwise holds 0.7 s
-	 * back, and a pipe reader (MistServer's ts-exec:, ffplay) should get
-	 * packets as soon as they exist rather than when a buffer fills.
+	 * Send live packets promptly. FFmpeg's TS muxer otherwise holds 0.7 s
+	 * before a pipe reader (MistServer's ts-exec:, ffplay) sees them.
 	 */
 	args[na++] = "-muxdelay";   args[na++] = "0";
 	args[na++] = "-muxpreload"; args[na++] = "0";
 	args[na++] = "-flush_packets"; args[na++] = "1";
-	args[na++] = "-f";          args[na++] = "mpegts";
+	args[na++] = "-f";          args[na++] = rtmp ? "flv" : "mpegts";
 	args[na++] = (char *)out;
 	args[na] = NULL;
 
@@ -609,7 +667,8 @@ int main(int argc, char **argv)
 	}
 	pthread_sigmask(SIG_SETMASK, &old, NULL);
 
-	fprintf(stderr, "is1ts: %s -> %s (%s, %u Hz, gain %+.1f dB)\n", in, out,
+	fprintf(stderr, "is1ts: %s -> %s (%s, %u Hz, gain %+.1f dB)\n", in,
+	        rtmp ? "RTMP destination" : out,
 	        mode == 0 ? "picture" : mode == 1 ? "key" : "picture + key", rate,
 	        20.0 * log10(gain));
 
@@ -642,6 +701,10 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* A service stop must not wait for a stalled ffmpeg input to drain. */
+	if (stopping) {
+		kill(pid, SIGTERM);
+	}
 	/* Drain and close the pipes: ffmpeg's cue to flush and finish the TS. */
 	for (i = 0; i < nin; i++) {
 		outq_close(&wq[i]);
